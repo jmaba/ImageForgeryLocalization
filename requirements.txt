@@ -1,0 +1,19 @@
+# Tested with the existing conda env `dm-image-detection` (Python 3.11, torch 2.3.1+cu121, RTX 2060 6GB)
+torch>=2.3
+torchvision
+transformers>=4.56
+diffusers>=0.30
+open_clip_torch>=3.0
+huggingface_hub>=0.34
+pyarrow>=15
+fsspec
+numpy
+scipy
+pandas
+scikit-learn>=1.5
+umap-learn
+matplotlib
+pillow
+opencv-python
+pyyaml
+tqdm

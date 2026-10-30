@@ -1,0 +1,55 @@
+# --- data & artefacts (never commit) ---
+# anchored to the repo root so the `ifl/data/` package is still tracked
+/data/
+/outputs/
+/cache/
+/checkpoints/
+/weights/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.z[0-9][0-9]
+
+# images / media anywhere in the tree (reports reference them from outputs/)
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.webp
+*.bmp
+*.gif
+*.mp4
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# local secrets
+.env
+hf_token*

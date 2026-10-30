@@ -1,0 +1,64 @@
+# Random-subset sampling of recent AIGC forgery datasets.
+# Unified labels:  0 = real / pristine,  1 = fully synthetic,  2 = locally manipulated (has mask)
+# Masks are stored as binary PNG (255 = manipulated). Images are stored as the ORIGINAL bytes
+# (no re-encoding) so low-level forensic traces are preserved; format is recorded in the manifest.
+
+seed: 1234
+out_dir: data/samples
+
+sources:
+  # OpenSDI (CVPR'25) test split: real COCO/SA-1B + full-generation + SAM-mask inpainting,
+  # 5 generators (SD1.5, SD2.1, SDXL, SD3, Flux.1-dev).
+  opensdi:
+    kind: hf_parquet
+    repo: nebula/OpenSDI_test
+    shard_prefixes: {sd15: "data/sd15-", sd2: "data/sd2-", sdxl: "data/sdxl-", sd3: "data/sd3-", flux: "data/flux-"}
+    per_subset: 120
+    row_groups_per_subset: 6
+    id_col: key
+    real_labels: [0]
+
+  # SID-Set (SIDA, CVPR'25): real / full synthetic (FLUX) / tampered (FLUX inpainting) with masks.
+  sid_set:
+    kind: hf_parquet
+    repo: saberzl/SID_Set
+    shard_prefixes: {flux: "data/validation-"}
+    per_subset: 300
+    row_groups_per_subset: 10
+    id_col: img_id
+    real_labels: [0]
+
+  # DiffSeg30k (2025): multi-turn local edits by 8 diffusion editors, per-pixel masks.
+  diffseg30k:
+    kind: hf_zip
+    repo: Chaos2629/Diffseg30k
+    file: validation.zip
+    n: 300
+    image_suffix: ".image.png"
+    mask_suffix: ".mask.png"
+
+  # Small test sets re-hosted in youqiwong/AIGC-Loc-Testsets (downloaded whole, then sampled).
+  # Newest commercial editors: GPT-Image-2 and Nano-Banana-2 (Gemini 3.1 Flash Image).
+  # PROVENANCE CAVEAT: that repo has no dataset card, licence or paper (checked 2026-10-30). Use for
+  # internal exploration only; for publication, obtain CocoGlide/AutoSplice from their original
+  # releases and treat the GPT-Image-2/NanoBanana2 masks as unverified.
+  gpt_image_2:
+    kind: hf_tar
+    repo: youqiwong/AIGC-Loc-Testsets
+    file: GPT-Image-2/newapi_gpt_image_2_bench.tar.gz
+    n: 300
+  nanobanana2:
+    kind: hf_tar
+    repo: youqiwong/AIGC-Loc-Testsets
+    file: NanoBanana2/NanoBanana2_gemini-3.1-flash-image_bench.tar.gz
+    n: 300
+  cocoglide:
+    kind: hf_tar
+    repo: youqiwong/AIGC-Loc-Testsets
+    file: glide_tp.tar
+    n: 300
+  autosplice:
+    kind: hf_tar
+    repo: youqiwong/AIGC-Loc-Testsets
+    file: AutoSplice_tp.tar
+    n: 300
