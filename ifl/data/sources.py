@@ -171,4 +171,98 @@ def sample_hf_tar(name: str, cfg: dict, out: Path, rng: random.Random) -> list[d
     return rows
 
 
-SAMPLERS = {"hf_parquet": sample_hf_parquet, "hf_zip": sample_hf_zip, "hf_tar": sample_hf_tar}
+# --------------------------------------------------------------------------- tgif2 (Nextcloud WebDAV)
+_NC = "https://cloud.ilabt.imec.be/public.php/webdav/"
+_NC_H = {"X-Requested-With": "XMLHttpRequest"}  # public WebDAV answers 401 without it
+
+
+def _nc_get(token, path, stream=False):
+    import requests
+    r = requests.get(_NC + path, auth=(token, ""), headers=_NC_H, stream=stream, timeout=120)
+    r.raise_for_status()
+    return r
+
+
+def _nc_tar_members(token, path, keep):
+    """Stream a remote .tar.gz once and yield (name, bytes) for members where keep(name) is True."""
+    r = _nc_get(token, path, stream=True)
+    r.raw.decode_content = True
+    with tarfile.open(fileobj=r.raw, mode="r|gz") as tf:
+        for m in tf:
+            if m.isfile() and keep(m.name):
+                yield m.name, tf.extractfile(m).read()
+
+
+def sample_tgif2(name: str, cfg: dict, out: Path, rng: random.Random) -> list[dict]:
+    """TGIF2 random-mask release. The SAME (coco_id, variant) pairs are drawn for every subset so that
+    FR / SP / original images of one edit are matched (enables the INP-X and aligned-real controls).
+    Writes one manifest dataset per subset: tgif2_<subset>, plus tgif2_orig (label 0)."""
+    import pandas as pd
+
+    split, tok = cfg["split"], cfg["token"]
+    rows = []
+    for model, subsets in cfg["models"].items():
+        meta = pd.read_csv(io.BytesIO(_nc_get(tok, f"metadata/{model}_{split}.csv").content))
+        meta = meta[meta.mask_variation == "random"].drop_duplicates("image_id")
+        pick = meta.sample(min(cfg["n"], len(meta)), random_state=rng.randrange(2 ** 31))
+        # sd2/sdxl metadata repeat image_id in gen_variation_id -> variant unknown, fixed while streaming
+        var_known = bool((pick.gen_variation_id != pick.image_id).all())
+        chosen = {str(r.image_id): (str(r.gen_variation_id) if var_known else None) for r in pick.itertuples()}
+        ids = set(chosen)
+        mfolder = cfg["mask_folder"][model]
+        masks = dict(_nc_tar_members(tok, f"{mfolder}/{mfolder}_{split}.tar.gz",
+                                     lambda n: Path(n).name.split("_")[0] in ids and "_mask_random" in n))
+        masks_by_id = {}
+        for n, b in masks.items():
+            masks_by_id.setdefault(Path(n).name.split("_")[0], []).append(b)
+
+        def best_mask(cid, size):
+            cands = masks_by_id.get(cid, [])
+            for b in cands:
+                if Image.open(io.BytesIO(b)).size == size:
+                    return b
+            return cands[0] if cands else None
+
+        for sub in subsets:
+            ds = f"tgif2_{sub.replace('-', '_')}"
+            got = 0
+
+            done = set()
+
+            def keep(n):
+                stem = Path(n).name
+                cid, var = stem.split("_")[0], stem.rsplit("_", 1)[-1][:-4]
+                if "_mask_random" not in stem or cid not in chosen or cid in done:
+                    return False
+                if chosen[cid] is None:  # first subset of this model fixes the variant for the others
+                    chosen[cid] = var
+                return chosen[cid] == var
+
+            for n, img in _nc_tar_members(tok, f"{sub}/{sub}_{split}.tar.gz", keep):
+                stem = Path(n).name
+                cid, var = stem.split("_")[0], stem.rsplit("_", 1)[-1][:-4]
+                done.add(cid)
+                w, h = Image.open(io.BytesIO(img)).size
+                mb = best_mask(cid, (w, h))
+                mask = _binarize_mask(mb, (w, h)) if mb else None
+                if mask is None or not mask.any():
+                    continue
+                rows.append(_write(out, ds, sub, f"{cid}_{var}", img, mask, LOCAL_EDIT,
+                                   dict(source_file=n, pair_id=f"{cid}_{var}", category=Path(n).parent.name)))
+                got += 1
+            print(f"  {ds}: {got}", flush=True)
+        if cfg.get("orig") and model == cfg["orig"]["model"]:
+            otok, ofolder = cfg["orig"]["token"], cfg["orig"]["folder"]
+            got = 0
+            for n, img in _nc_tar_members(otok, f"{ofolder}/{ofolder}_{split}.tar.gz",
+                                          lambda n: Path(n).name.split("_")[0] in ids and n.endswith("_orig.png")):
+                cid = Path(n).name.split("_")[0]
+                rows.append(_write(out, "tgif2_orig", "orig", cid, img, None, REAL,
+                                   dict(source_file=n, pair_id=cid, category=Path(n).parent.name)))
+                got += 1
+            print(f"  tgif2_orig: {got}", flush=True)
+    return rows
+
+
+SAMPLERS = {"hf_parquet": sample_hf_parquet, "hf_zip": sample_hf_zip, "hf_tar": sample_hf_tar,
+            "tgif2": sample_tgif2}

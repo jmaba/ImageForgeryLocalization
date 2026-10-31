@@ -80,6 +80,29 @@ def probe_image(fs, folds=5) -> dict:
     return out
 
 
+def task_whole_image(fs) -> dict:
+    """Task A - entirely generated vs real (local edits excluded). Grouped CV inside every dataset that
+    has both classes, plus cross-dataset transfer between them (train on one, test on the other)."""
+    meta = fs.meta
+    sel = meta.label.isin([REAL, 1]).values
+    out = {}
+    dss = [d for d in meta.dataset[sel].unique()
+           if meta[(meta.dataset == d) & sel].label.nunique() == 2]
+    X, y = fs.G, (meta.label == 1).astype(int).values
+    for a in dss:
+        ia = np.where(sel & (meta.dataset == a).values)[0]
+        oof = np.zeros(len(ia))
+        for tr, te in StratifiedGroupKFold(5, shuffle=True, random_state=SEED).split(ia, y[ia], _groups(meta).values[ia]):
+            oof[te] = _linear(X.shape[1]).fit(X[ia[tr]], y[ia[tr]]).decision_function(X[ia[te]])
+        out[f"A_cv:{a}"] = _auc(y[ia], oof)
+        m = _linear(X.shape[1]).fit(X[ia], y[ia])
+        for b in dss:
+            if b != a:
+                ib = np.where(sel & (meta.dataset == b).values)[0]
+                out[f"A_transfer:{a}->{b}"] = _auc(y[ib], m.decision_function(X[ib]))
+    return out
+
+
 def lodo_image(fs) -> pd.DataFrame:
     """Hold out every fake sample of one dataset; reals split into a train half / test half."""
     meta, X = fs.meta, fs.G
@@ -157,9 +180,8 @@ def _edited(fs):
 def _train_patches(fs, idx, lab, per_class=24, rng=None, extra_real=None):
     rng = rng or np.random.default_rng(SEED)
     Xs, ys = [], []
-    D = fs.P.shape[-1]
     for i in idx:
-        P = fs.P[i].reshape(-1, D)
+        P = img_feats(fs, [i]).reshape(-1, feat_dim(fs))
         l = lab[i].reshape(-1)
         for c in (0, 1):
             w = np.where(l == c)[0]
@@ -168,17 +190,39 @@ def _train_patches(fs, idx, lab, per_class=24, rng=None, extra_real=None):
                 Xs.append(P[w]); ys.append(np.full(len(w), c))
     for i in (extra_real if extra_real is not None else []):
         w = rng.choice(fs.P.shape[1] * fs.P.shape[2], per_class, replace=False)
-        Xs.append(fs.P[i].reshape(-1, D)[w]); ys.append(np.zeros(per_class, int))
+        Xs.append(img_feats(fs, [i]).reshape(-1, feat_dim(fs))[w]); ys.append(np.zeros(per_class, int))
     return np.concatenate(Xs).astype(np.float32), np.concatenate(ys)
 
 
+# How patch features are presented to the probes:
+#   "raw"      the cached descriptor
+#   "relative" deviation from the image's own patches: (z - median_img) / (MAD_img + eps) per channel.
+#              Localization of a PARTIAL edit is an intra-image inconsistency problem; this removes the
+#              image-global component (content style, JPEG history, a whole-image VAE re-decode).
+#   "both"     concatenation of the two
+FEATURE_MODE = "raw"
+
+
+def feat_dim(fs):
+    return fs.P.shape[-1] * (2 if FEATURE_MODE == "both" else 1)
+
+
+def img_feats(fs, idx):
+    P = np.asarray(fs.P[idx], np.float32)  # [n,g,g,D]
+    if FEATURE_MODE == "raw":
+        return P
+    med = np.median(P, axis=(1, 2), keepdims=True)
+    mad = np.median(np.abs(P - med), axis=(1, 2), keepdims=True)
+    rel = (P - med) / (1.4826 * mad + 1e-3)
+    return rel if FEATURE_MODE == "relative" else np.concatenate([P, rel], -1)
+
+
 def _score_images(model, fs, idx):
-    D = fs.P.shape[-1]
     g = fs.grid
     out = np.zeros((len(idx), g, g), np.float32)
     for k in range(0, len(idx), 64):
         chunk = idx[k:k + 64]
-        X = fs.P[chunk].reshape(-1, D).astype(np.float32)
+        X = img_feats(fs, chunk).reshape(-1, feat_dim(fs))
         out[k:k + len(chunk)] = model.decision_function(X).reshape(len(chunk), g, g)
     return out
 

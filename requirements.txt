@@ -17,3 +17,6 @@ pillow
 opencv-python
 pyyaml
 tqdm
+tabulate
+requests
+pytest

@@ -25,6 +25,16 @@ class FeatureSet:
         return self.M.shape[1]
 
 
+def load_multi(spec_dirnames: list[str], datasets: list[str] | None = None) -> FeatureSet:
+    """Concatenate several cached feature specs along the channel axis (same manifest order)."""
+    sets = [load(s, datasets) for s in spec_dirnames]
+    ids = [tuple(fs.meta.dataset + "/" + fs.meta.sample_id.astype(str)) for fs in sets]
+    if any(i != ids[0] for i in ids[1:]):
+        raise RuntimeError(f"specs {spec_dirnames} cover different images - extract them on the same datasets")
+    return FeatureSet("+".join(spec_dirnames), sets[0].meta, np.concatenate([fs.G for fs in sets], 1),
+                      np.concatenate([fs.P for fs in sets], -1), sets[0].M)
+
+
 def available_specs() -> list[str]:
     return sorted(p.name for p in FEAT.iterdir() if p.is_dir() and not p.name.startswith("_"))
 

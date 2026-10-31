@@ -37,6 +37,22 @@ sources:
     image_suffix: ".image.png"
     mask_suffix: ".mask.png"
 
+  # TGIF2 (J. Information Security 2026, arXiv 2603.28613; CC BY-SA 4.0; github.com/IDLabMedia/tgif-dataset)
+  # Random-mask release only (no object bias). The same (COCO id, variant) is drawn for the FR, SP and
+  # original images -> matched pairs for the INP-X / aligned-real controls. Streams ~5.5 GB of the
+  # validation archives once and keeps only the sampled members.
+  tgif2:
+    kind: tgif2
+    token: GDGewtTFcHccaNj          # public share "TGIF2 random images"
+    split: validation
+    n: 150
+    models:
+      flux1dev: [flux1dev-fr, flux1dev-sp]
+      sd2: [sd2-fr, sd2-sp]
+      sdxl: [sdxl-fr]
+    mask_folder: {flux1dev: masks-flux, sd2: masks-sd2, sdxl: masks-sdxl}
+    orig: {model: flux1dev, token: KG48tLZZzifC5WE, folder: orig-flux}   # public share "TGIF2 FLUX images"
+
   # Small test sets re-hosted in youqiwong/AIGC-Loc-Testsets (downloaded whole, then sampled).
   # Newest commercial editors: GPT-Image-2 and Nano-Banana-2 (Gemini 3.1 Flash Image).
   # PROVENANCE CAVEAT: that repo has no dataset card, licence or paper (checked 2026-10-30). Use for

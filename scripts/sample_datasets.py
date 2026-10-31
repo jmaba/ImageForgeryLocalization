@@ -38,8 +38,8 @@ def main():
             print(f"[{name}] FAILED: {type(e).__name__}: {e}", flush=True)
             continue
         new = pd.DataFrame(rows)
-        if len(old):
-            old = old[old.dataset != name]
+        if len(old):  # a source may write several datasets (e.g. tgif2 -> tgif2_sd2_fr, tgif2_orig ...)
+            old = old[(old.dataset != name) & ~old.dataset.str.startswith(name + "_")]
         old = pd.concat([old, new], ignore_index=True)
         old.to_csv(manifest, index=False)  # checkpoint after every source
         print(f"[{name}] {len(new)} samples  labels={new.label.value_counts().to_dict()}", flush=True)

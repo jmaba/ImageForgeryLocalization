@@ -177,6 +177,15 @@ def build(spec: str):
         return SRMStats()
     if name == "vaerec":
         return VAERecon()
+    if name == "lift":  # self-supervised real-only learned lifting wavelet (ifl/ssl/lifting.py)
+        from ifl.ssl.lifting import LiftStats
+        return LiftStats()
+    if name in ("dtcwt", "shear"):  # sparse directional multiscale statistics (ifl/features/multiscale.py)
+        from ifl.features.multiscale import DTCWTStats, ShearStats
+        return DTCWTStats() if name == "dtcwt" else ShearStats()
+    if name.startswith("rt2-"):  # Proposal 2: double round-trip through the named VAE (rt2-sd, rt2-qwen ...)
+        from ifl.features.roundtrip import RoundTrip
+        return RoundTrip(name[4:])
     raise KeyError(spec)
 
 
