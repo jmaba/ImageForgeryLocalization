@@ -132,3 +132,59 @@ Supervised: E3 DINOv2 probe trained on real SD2 inpainting.
 - Add leave-one-decoder-out training to measure transfer honestly.
 - Replace the hard majority reference with a spectral two-cluster score, and add a conformal image-level
   decision.
+
+## 6. Scaled generator: more decoders, object masks, real inpainting (2026-11-01)
+
+**Training data (v2, `data/splices_v2/`).** Same 1,300 real non-COCO photos, two shards:
+- `vae` (5,200): SD, SDXL, Qwen-Image, TAESD and MoVQ (Kandinsky 2.2) round-trips, about 700 each; 736 processed;
+  387 real-in-real; 537 untouched.
+- `inpaint` (1,300): SD1.5 inpainting with random prompts. 842 are pasted back (`inpaint_sp`, only the masked
+  region changes). 458 are fully regenerated (`inpaint_fr`, the whole image is re-decoded).
+- Half of the masks are object-shaped: connected segments of a k-means clustering of the image's own DINOv2
+  tokens. The other half are random blobs.
+- Not used: DC-AE (its download stalled) and the FLUX VAE (gated). FLUX is therefore unseen in every run.
+
+All rows below use DINOv2-L6+SRM. Localisation is per-image AUC; "null" is TGIF2 authentic images scored with the
+masks of their own edits.
+
+| training data | mean loc. AUC (12) | TGIF2 FLUX FR / SP | TGIF2 null | gain over null | TPR@5%FPR SD2-FR / SDXL-FR / FLUX-FR |
+|---|---|---|---|---|---|
+| v1 (section 5) | 0.675 | 0.629 / 0.680 | 0.564 | +0.107 | 0.18 / 0.16 / 0.07 |
+| v2 `vae` | 0.667 | 0.596 / 0.634 | 0.516 | +0.133 | 0.70 / 0.26 / 0.08 |
+| v2 `vae` + `inpaint` | **0.676** | 0.621 / 0.654 | 0.529 | **+0.144** | 0.39 / 0.21 / 0.11 |
+| v2 `vae` + `inpaint`, no `inpaint_fr` | 0.674 | 0.623 / 0.655 | 0.530 | +0.143 | **0.77 / 0.33** / 0.09 |
+
+(Localisation uses `pair_ref`; image-level TPR uses the `point` head, which is the stronger head for detection.
+For SD2-FR the image AUC is 0.966 with the last configuration.)
+
+**Leave-one-decoder-out (on the `vae` shard).**
+- SDXL held out: SDXL-FR localisation goes from 0.701 to 0.677 and TPR from 0.26 to 0.23. Most of the
+  signal transfers to this unseen VAE.
+- SD held out: SD2-FR TPR is still 0.57. This is not a clean hold-out, because TAESD is distilled from the SD
+  VAE and stays in training.
+- Qwen held out: only DiffSeg30k drops (0.770 to 0.694). Possibly its editors share a Qwen-like VAE; this is
+  not checked.
+- No real-in-real splices: content-changing edits (CocoGlide, OpenSDI, Nano-Banana) lose 0.02 to 0.04. Keep them.
+
+**What this says.**
+1. **Object masks remove the object prior.** The null drops from 0.564 to 0.516–0.53 (SID-Set: 0.603 to 0.52).
+   The gain over the matched null rises from +0.107 to +0.14. Part of v1's lead on CocoGlide (0.753 to 0.72)
+   and DiffSeg30k (0.837 to 0.73) was mask shape, not trace.
+2. **Real paste-back inpainting adds localisation** on every TGIF2 subset (+0.02 to +0.03) and on AutoSplice
+   (+0.02 to +0.03).
+3. **Fully regenerated inpaints hurt image-level detection** (SD2-FR TPR drops from 0.77 to 0.39). In those images the
+   "authentic" cells are also VAE-decoded, so they teach the model that a global VAE trace is normal. They are
+   label noise for the question "did this cell come from the camera?". Leave them out of training; use them only
+   as a test condition.
+4. **Unseen-VAE transfer works across the SD family (SDXL) but not to FLUX.** FLUX-FR image TPR stays at
+   0.07–0.11 in every configuration. More decoder families of the same kind (4-channel, 8x downsampling) do not
+   reach a 16-channel VAE. GPT-Image-2 stays at chance.
+
+**Recommended configuration:** `vae` + `inpaint` without `inpaint_fr`. Use `pair_ref` for localisation (0.674,
+null 0.53) and `point` for the image-level decision.
+
+**Next steps.**
+- Add 16-channel decoders: FLUX VAE (needs the licence click), SD3 VAE, and the DC-AE retry. FLUX would then
+  have to be held out explicitly.
+- Add finer cells (48x48 SRM).
+- Run a spectral two-cluster reference instead of the majority half.
