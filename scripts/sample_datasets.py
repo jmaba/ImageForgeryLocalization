@@ -23,7 +23,7 @@ def main():
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
-    out = ROOT / cfg["out_dir"]
+    out = DATA / cfg["out_dir"]
     manifest = out / "manifest.csv"
     old = pd.read_csv(manifest) if manifest.exists() else pd.DataFrame()
 
@@ -44,7 +44,7 @@ def main():
         old.to_csv(manifest, index=False)  # checkpoint after every source
         print(f"[{name}] {len(new)} samples  labels={new.label.value_counts().to_dict()}", flush=True)
 
-    print(f"\nmanifest: {manifest.relative_to(ROOT)}  ({len(old)} rows)")
+    print(f"\nmanifest: {manifest}  ({len(old)} rows)")
     if len(old):
         print(old.groupby(["dataset", "label"]).size().unstack(fill_value=0))
 

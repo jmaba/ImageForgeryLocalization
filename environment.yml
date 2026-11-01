@@ -1,0 +1,16 @@
+# conda / mamba alternative to scripts/setup_env.sh:
+#   mamba env create -f environment.yml && conda activate ifl
+# Change pytorch-cuda to match your driver (nvidia-smi); drop it (and add `cpuonly`) for CPU-only machines.
+name: ifl
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pytorch>=2.3
+  - torchvision
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+      - -r requirements.txt

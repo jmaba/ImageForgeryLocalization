@@ -28,13 +28,42 @@ scripts/analyze_features.py  -> outputs/reports/<backbone>/report.html, outputs/
 
 `data/` and `outputs/` are git-ignored (as are all images, weights, archives, arrays).
 
-## Quick start (Windows, existing conda env)
+## Setup (Linux / cloud GPU)
+
+Only a system Python is assumed. `setup_env.sh` installs [uv](https://github.com/astral-sh/uv), which fetches
+Python 3.11, then installs a CUDA build of torch and `requirements.txt` into `.venv/`.
 
 ```bash
-set PY=C:\Users\jm_ab\miniconda3\envs\dm-image-detection\python.exe
-%PY% scripts/sample_datasets.py                     # ~3k images, ~1 GB, random but seeded
-%PY% scripts/extract_features.py --backbones pixels dinov2 dinov2:l6 siglip2 clip srm vaerec
-%PY% scripts/analyze_features.py
+git clone https://github.com/jmaba/ImageForgeryLocalization.git && cd ImageForgeryLocalization
+bash scripts/setup_env.sh                  # or: bash scripts/setup_env.sh cu121 | cpu
+source .venv/bin/activate
+bash scripts/download_data.sh              # test sets + real-only training pool -> ./data
+```
+
+Data goes to `./data` and results to `./outputs` by default. To use another disk, pass a path to
+`download_data.sh` and export the same path afterwards:
+
+```bash
+bash scripts/download_data.sh /mnt/volume/ifl-data
+export IFL_DATA=/mnt/volume/ifl-data       # read by every script (ifl/__init__.py)
+export IFL_OUTPUTS=/mnt/volume/ifl-outputs # optional
+```
+
+Conda / mamba alternative: `mamba env create -f environment.yml && conda activate ifl`.
+Model weights download from the Hugging Face Hub on first use. Gated ones (DINOv3, FLUX VAE) need the
+licence accepted on the website and `hf auth login`.
+
+## Pipeline
+
+```bash
+python scripts/extract_features.py --backbones pixels dinov2:l6 srm      # frozen 24x24 cell features of the test sets
+python scripts/analyze_features.py                                      # representativeness reports
+python scripts/region_tests.py --specs srm dinov2_l6 --controls         # training-free region consistency (docs/03 s.1)
+python scripts/region_null.py --specs srm dinov2_l6                     # transplant null + image-level FPR (docs/03 s.2)
+python scripts/make_splices.py --shard vae --versions 4     --types vae:sd vae:sdxl vae:qwen vae:taesd vae:movq proc real none # self-made real-only splices
+python scripts/make_splices.py --shard inpaint --versions 1 --max-side 512 --types inpaint_sp inpaint_fr
+python scripts/train_comparator.py --shards vae inpaint --tag all       # learned comparator (docs/03 s.5)
+python scripts/train_comparator.py --shards vae inpaint --exclude-types vae:qwen --tag loo_qwen
 ```
 
 Open `outputs/reports/index.html` for the backbone comparison.

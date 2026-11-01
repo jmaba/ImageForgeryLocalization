@@ -137,38 +137,95 @@ def evaluate(model, kind, X, lab):
     return out
 
 
+def shard_dir(name):
+    return DATA / "splices" if name == "v1" else DATA / "splices_v2" / name
+
+
+class Projector:
+    """Per-feature PCA (only for D > n_pca) followed by standardisation, fitted on training splices and
+    applied unchanged to the test features. Keeps ~6.5k images x 576 cells in RAM (DINOv2 is 768-D)."""
+
+    def __init__(self, dims, n_pca=256):
+        self.dims, self.n_pca, self.P, self.mu, self.sd = dims, n_pca, {}, None, None
+
+    def _split(self, x):
+        return np.split(x, np.cumsum(self.dims)[:-1], axis=-1)
+
+    def fit(self, sample):
+        parts = []
+        for k, p in enumerate(self._split(sample)):
+            if p.shape[-1] > self.n_pca:
+                m = p.mean(0)
+                _, _, vt = np.linalg.svd(p - m, full_matrices=False)
+                self.P[k] = (m, vt[:self.n_pca].T)
+                p = (p - m) @ self.P[k][1]
+            parts.append(p)
+        z = np.concatenate(parts, -1)
+        self.mu, self.sd = z.mean(0), z.std(0) + 1e-4
+        return self
+
+    def __call__(self, x):
+        parts = [((p - self.P[k][0]) @ self.P[k][1]) if k in self.P else p for k, p in enumerate(self._split(x))]
+        return ((np.concatenate(parts, -1) - self.mu) / self.sd).astype(np.float32)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--feats", nargs="+", default=["dinov2_l6", "srm"])
-    ap.add_argument("--steps", type=int, default=3000)
+    ap.add_argument("--shards", nargs="+", default=["vae", "inpaint"], help="data/splices_v2/<shard>, or v1")
+    ap.add_argument("--exclude-types", nargs="*", default=[], help="splice types left out of TRAINING")
+    ap.add_argument("--tag", default=None)
+    ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--max-per-dataset", type=int, default=150)
     args = ap.parse_args()
-    tag = "+".join(args.feats)
+    tag = args.tag or "+".join(args.feats)
     out = OUTPUTS / "comparator"
     out.mkdir(parents=True, exist_ok=True)
 
-    # ---------------- training data: real-only splices
-    meta = pd.read_csv(DATA / "splices" / "meta.csv")
-    X = np.concatenate([np.load(DATA / "splices" / f"{f}.npy").reshape(len(meta), G2, -1) for f in args.feats], -1)
-    lab = labels(np.load(DATA / "splices" / "masks.npy").astype(np.float32).reshape(len(meta), G2))
+    # ---------------- training data: real-only splices (memmapped shards, projected chunk-wise)
+    metas, mms = [], []
+    for s in args.shards:
+        m = pd.read_csv(shard_dir(s) / "meta.csv")
+        m["shard"] = s
+        metas.append(m)
+        mms.append([np.load(shard_dir(s) / f"{f}.npy", mmap_mode="r") for f in args.feats] +
+                   [np.load(shard_dir(s) / "masks.npy", mmap_mode="r")])
+    meta = pd.concat(metas, ignore_index=True)
+    if "mask_kind" not in meta:
+        meta["mask_kind"] = np.where(meta.type == "none", "none", "random")
+    dims = [mm.shape[-1] for mm in mms[0][:-1]]
     rng = np.random.default_rng(0)
     pool_ids = meta.pool_idx.unique()
     va_pool = set(rng.choice(pool_ids, int(0.15 * len(pool_ids)), replace=False))
-    va = np.where(meta.pool_idx.isin(va_pool))[0]
-    tr = np.where(~meta.pool_idx.isin(va_pool))[0]
-    sub = X[rng.choice(tr, min(600, len(tr)), replace=False)].reshape(-1, X.shape[-1]).astype(np.float32)
-    mu, sd = sub.mean(0), sub.std(0) + 1e-4
-    for k in range(0, len(X), 200):   # in place, chunked (X is ~2.4 GB in fp16)
-        X[k:k + 200] = ((X[k:k + 200].astype(np.float32) - mu) / sd).astype(np.float16)
-    print(f"[{tag}] train {len(tr)}  val {len(va)}  D={X.shape[-1]}", flush=True)
+    is_va = meta.pool_idx.isin(va_pool).values
+    va = np.where(is_va)[0]
+    tr = np.where(~is_va & ~meta.type.isin(args.exclude_types).values)[0]
+    rows_of = []                                   # global row -> (shard, local row)
+    for si, m in enumerate(metas):
+        rows_of += [(si, r) for r in range(len(m))]
+
+    def raw(idx):
+        return np.stack([np.concatenate([np.asarray(mms[rows_of[g][0]][k][rows_of[g][1]], np.float32)
+                                         .reshape(G2, -1) for k in range(len(dims))], -1) for g in idx])
+
+    proj = Projector(dims).fit(raw(rng.choice(tr, min(150, len(tr)), replace=False)).reshape(-1, sum(dims)))
+    X = np.empty((len(meta), G2, len(proj.mu)), np.float16)
+    for k in range(0, len(meta), 100):
+        idx = np.arange(k, min(k + 100, len(meta)))
+        X[idx] = proj(raw(idx)).astype(np.float16)
+    lab = labels(np.stack([np.asarray(mms[s][-1][r], np.float32).reshape(G2) for s, r in rows_of]))
+    print(f"[{tag}] shards {args.shards}  train {len(tr)}  val {len(va)}  D={X.shape[-1]}  "
+          f"excluded {args.exclude_types}", flush=True)
     models = {k: train(k, X, lab, tr, va, X.shape[-1], args.steps) for k in ("pair", "point")}
     val_rows = []
     for k, m in models.items():
-        for t in meta.type.unique():
-            sel = va[meta.type.values[va] == t]
+        for (t, mk), sel in meta.iloc[va].groupby(["type", "mask_kind"]).groups.items():
             if t != "none":
-                val_rows.append(dict(model=k, type=t, auc=np.nanmean(evaluate(m, k, X[sel], lab[sel]))))
-    print(pd.DataFrame(val_rows).pivot_table(index="type", columns="model", values="auc").round(3), flush=True)
+                sel = np.asarray(sel)
+                val_rows.append(dict(model=k, type=t + (" (held out)" if t in args.exclude_types else ""),
+                                     mask=mk, auc=np.nanmean(evaluate(m, k, X[sel], lab[sel]))))
+    val_tab = pd.DataFrame(val_rows).pivot_table(index=["type", "mask"], columns="model", values="auc").round(3)
+    print(val_tab, flush=True)
     del X
 
     # ---------------- test: all edited datasets + authentic images with transplanted masks
@@ -195,7 +252,7 @@ def main():
                 jobs.append((i, tlab[j].reshape(-1), dict(dataset=d, domain=dom, kind="authentic")))
     rows = []
     for n, (i, l, info) in enumerate(jobs):
-        x = ((np.asarray(fs.P[i], np.float32).reshape(G2, -1) - mu) / sd).astype(np.float32)
+        x = proj(np.asarray(fs.P[i], np.float32).reshape(G2, -1))
         C = np.asarray(pix.P[pkey[keys[i]]], np.float32).reshape(G2, -1)
         ps = cell_scores(C, C)["loc_cf"]
         v = l >= 0
@@ -224,8 +281,9 @@ def main():
                             img_auc=roc_auc_score(y, np.r_[a, e["T"].values])))
     img = pd.DataFrame(img)
     with open(out / f"results_{tag}.md", "w") as f:
-        f.write(f"# Learned real-only comparator - features {tag}\n\n## Validation (held-out pool images)\n\n")
-        f.write(pd.DataFrame(val_rows).pivot_table(index="type", columns="model", values="auc").round(3).to_markdown())
+        f.write(f"# Learned real-only comparator - {tag}\n\nfeatures {args.feats}, shards {args.shards}, "
+                f"types excluded from training {args.exclude_types}\n\n## Validation (held-out pool images)\n\n")
+        f.write(val_tab.to_markdown())
         f.write("\n\n## Edited: per-image AUC\n\n" + loc.round(3).to_markdown())
         f.write("\n\n## Authentic + transplanted masks: per-image AUC (must be 0.5)\n\n" + null.round(3).to_markdown())
         f.write("\n\n## Image-level AUC (edited vs authentic of the same domain)\n\n" +

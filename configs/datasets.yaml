@@ -4,7 +4,7 @@
 # (no re-encoding) so low-level forensic traces are preserved; format is recorded in the manifest.
 
 seed: 1234
-out_dir: data/samples
+out_dir: samples            # relative to the data dir ($IFL_DATA, default <repo>/data)
 
 sources:
   # OpenSDI (CVPR'25) test split: real COCO/SA-1B + full-generation + SAM-mask inpainting,
