@@ -183,6 +183,13 @@ def build(spec: str):
     if name in ("dtcwt", "shear"):  # sparse directional multiscale statistics (ifl/features/multiscale.py)
         from ifl.features.multiscale import DTCWTStats, ShearStats
         return DTCWTStats() if name == "dtcwt" else ShearStats()
+    if name in ("dtcwt_phase", "fft_band", "gabor_opp", "medres_lab"):  # ported streams (docs/04)
+        from ifl.features import legacy
+        return {"dtcwt_phase": legacy.DTCWTPhase, "fft_band": legacy.FFTBand,
+                "gabor_opp": legacy.GaborOpp, "medres_lab": legacy.MedResLab}[name]()
+    if name in ("psteer", "wph"):  # steerable-pyramid PS stats / scattering spectra + phase harmonics
+        from ifl.features.scattering import SteerPyrPS, WPHScat
+        return SteerPyrPS() if name == "psteer" else WPHScat()
     if name.startswith("rt2-"):  # Proposal 2: double round-trip through the named VAE (rt2-sd, rt2-qwen ...)
         from ifl.features.roundtrip import RoundTrip
         return RoundTrip(name[4:])

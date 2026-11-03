@@ -20,14 +20,24 @@ def load_manifest(path=None) -> pd.DataFrame:
 
 
 def harmonize(im: Image.Image, mode: str | None) -> Image.Image:
-    """Optional format harmonisation to remove the JPEG-vs-PNG shortcut ('jpeg95', 'png' or None)."""
-    if not mode:
+    """Optional re-encoding applied before feature extraction.
+    'jpegQ' / 'webpQ' re-encode at quality Q (jpeg95 also removes the JPEG-vs-PNG shortcut), 'resizeP' downscales
+    to P% of the side (kept small, as when an image is shared). 'sr*' modes are precomputed files, see
+    scripts/make_perturbed.py, and are resolved in ManifestImages."""
+    if not mode or mode.startswith("sr"):
         return im
-    if mode.startswith("jpeg"):
+    if mode.startswith(("jpeg", "webp")):
         buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=int(mode[4:] or 95))
+        im.save(buf, "JPEG" if mode.startswith("jpeg") else "WEBP", quality=int(mode[4:] or 95))
         return Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
-    return im
+    if mode.startswith("resize"):
+        s = int(mode[6:]) / 100
+        return im.resize((max(8, round(im.width * s)), max(8, round(im.height * s))), Image.BICUBIC)
+    raise ValueError(f"unknown harmonize mode {mode!r}")
+
+
+def perturbed_path(img_path: str, mode: str):
+    return DATA / "perturbed" / mode / (str(img_path) + ".png")
 
 
 def mask_grid(row, grid: int) -> np.ndarray:
@@ -57,7 +67,8 @@ class ManifestImages(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         r = self.df.iloc[i]
-        im = harmonize(Image.open(DATA / r.img_path).convert("RGB"), self.hm)
+        src = perturbed_path(r.img_path, self.hm) if self.hm and self.hm.startswith("sr") else DATA / r.img_path
+        im = harmonize(Image.open(src).convert("RGB"), self.hm)
         if self.size:
             im = im.resize((self.size, self.size), Image.BICUBIC)
         elif self.max_side and max(im.size) > self.max_side:

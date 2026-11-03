@@ -34,6 +34,7 @@ def main():
     ap.add_argument("--harmonize", default=None, help="e.g. jpeg95 to re-encode every image first")
     ap.add_argument("--native-max-side", type=int, default=1024)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--workers", type=int, default=2, help="DataLoader workers (each holds its own copy of torch)")
     args = ap.parse_args()
 
     df = load_manifest()
@@ -63,7 +64,7 @@ def main():
             out.mkdir(parents=True, exist_ok=True)
             loader = torch.utils.data.DataLoader(
                 ManifestImages(sub, size, args.harmonize, None if size else args.native_max_side),
-                batch_size=args.batch if size else 1, num_workers=4, shuffle=False)
+                batch_size=args.batch if size else 1, num_workers=args.workers, shuffle=False)
             G, P = [], []
             t0 = time.time()
             for x, _ in tqdm(loader, desc=f"{spec}/{ds}", leave=False):

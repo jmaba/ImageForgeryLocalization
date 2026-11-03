@@ -264,5 +264,89 @@ def sample_tgif2(name: str, cfg: dict, out: Path, rng: random.Random) -> list[di
     return rows
 
 
+# --------------------------------------------------------------------------- local (classical benchmarks on disk)
+def _local_items(layout: str, root: Path):
+    """-> list of (edited_image, mask, invert_mask, key, subset, authentic_image or None)."""
+    items = []
+    if layout == "diverse":                      # <method>/NNNNNN.png + NNNNNN_mask.png (IID-Net, 11 methods)
+        for m in sorted(p for p in root.iterdir() if p.is_dir()):
+            items += [(p, p.with_name(p.stem + "_mask.png"), False, f"{m.name}_{p.stem}", m.name, None)
+                      for p in sorted(m.glob("*.png")) if not p.stem.endswith("_mask")]
+    elif layout == "imd2020_inpaint":            # images/x.jpg + masks/x_mask.jpg
+        items = [(p, root / "masks" / f"{p.stem}_mask.jpg", False, p.stem, "all", None)
+                 for p in sorted((root / "images").glob("*.jpg"))]
+    elif layout == "imd2020_real":               # <id>/<id>_orig.jpg + <id>/<edit>_0.jpg + <edit>_0_mask.png
+        for d in sorted(p for p in root.iterdir() if p.is_dir()):
+            orig = next(iter(d.glob("*_orig.*")), None)
+            items += [(p, p.with_name(p.stem + "_mask.png"), False, f"{d.name}_{p.stem}", "all", orig)
+                      for p in sorted(d.iterdir()) if p.suffix.lower() in (".jpg", ".png", ".jpeg")
+                      and "_orig" not in p.stem and not p.stem.endswith("_mask")
+                      and p.with_name(p.stem + "_mask.png").exists()]
+    elif layout == "korus":                      # <cam>/tampered-realistic/X.TIF, ground-truth/X.PNG, pristine/X.TIF
+        for cam in sorted(p for p in root.iterdir() if (p / "tampered-realistic").is_dir()):
+            items += [(p, cam / "ground-truth" / f"{p.stem}.PNG", False, f"{cam.name}_{p.stem}", cam.name,
+                       cam / "pristine" / p.name) for p in sorted((cam / "tampered-realistic").iterdir())]
+    elif layout == "nc2016":                     # reference csv: IsTarget=Y rows; masks are 0 = manipulated
+        import pandas as pd
+        ref = pd.read_csv(root / "reference" / "manipulation" / "NC2016-manipulation-ref.csv", sep="|")
+        ref = ref[(ref.IsTarget == "Y") & ref.ProbeMaskFileName.notna()].drop_duplicates("ProbeFileID")
+        for r in ref.itertuples():
+            mask = root / "reference" / "manipulation" / "mask" / Path(r.ProbeMaskFileName).name
+            base = root / r.BaseFileName if isinstance(r.BaseFileName, str) else None
+            items.append((root / r.ProbeFileName, mask, True, r.ProbeFileID, "manipulation", base))
+    elif layout == "defacto_inpaint":            # img/x.tif + inpaint_mask/x.tif (COCO-based)
+        items = [(p, root / "inpaint_mask" / p.name, False, p.stem, "inpaint", None)
+                 for p in sorted((root / "img").glob("*.tif"))]
+    elif layout == "cmfd_velo":                  # <cam>/X_N.png + X_N_alpha.png, original X_orig.*
+        for cam in sorted(p for p in root.iterdir() if p.is_dir()):
+            for p in sorted(cam.glob("*_[0-9]*.png")):
+                if p.stem.endswith("_alpha") or "_trim" in p.stem:
+                    continue
+                scene = p.stem.rsplit("_", 1)[0]
+                orig = next(iter(cam.glob(f"{scene}_orig.*")), None)
+                items.append((p, p.with_name(p.stem + "_alpha.png"), False, f"{cam.name}_{p.stem}", cam.name, orig))
+    else:
+        raise KeyError(layout)
+    return [it for it in items if it[1].exists()]
+
+
+def sample_local(name: str, cfg: dict, out: Path, rng: random.Random) -> list[dict]:
+    """Datasets already on disk. Samples `n` edited images (stratified over subsets) and, where the dataset
+    ships the untouched original, writes it as a REAL row with the SAME pair_id (matched transplant null)."""
+    import os
+    root = Path(os.environ.get("IFL_BENCHMARKS", "M:/Benchmarks")) / cfg["dir"]
+    if not root.is_dir():
+        raise FileNotFoundError(f"{root} (set IFL_BENCHMARKS to the folder holding the classical benchmarks)")
+    items = _local_items(cfg["layout"], root)
+    by_sub = {}
+    for it in items:
+        by_sub.setdefault(it[4], []).append(it)
+    per = int(np.ceil(cfg["n"] / len(by_sub)))
+    picks = [it for sub in sorted(by_sub) for it in rng.sample(by_sub[sub], min(per, len(by_sub[sub])))]
+    picks = rng.sample(picks, min(cfg["n"], len(picks)))
+    rows, seen = [], set()
+    for img_p, mask_p, invert, key, sub, orig in picks:
+        b = img_p.read_bytes()
+        w, h = Image.open(io.BytesIO(b)).size
+        m = np.asarray(Image.open(mask_p).convert("L"))
+        # > 64: keeps Korus' grey "collateral damage" (128, tampered by the dataset's own convention) and
+        # drops JPEG noise in IMD2020's .jpg masks; NC2016 masks are inverted (0 = manipulated)
+        mb = Image.fromarray(np.where(m > 64 if not invert else m < 128, 255, 0).astype(np.uint8))
+        buf = io.BytesIO()
+        mb.save(buf, "PNG")
+        mask = _binarize_mask(buf.getvalue(), (w, h))
+        if mask is None or not mask.any() or mask.all():
+            continue
+        pid = f"{name}:{key}"
+        rows.append(_write(out, name, sub, key, b, mask, LOCAL_EDIT, dict(source_file=str(img_p), pair_id=pid)))
+        if orig is not None and orig.exists() and str(orig) not in seen:   # one original may have several edits
+            seen.add(str(orig))
+            rows.append(_write(out, name, sub, f"{key}__orig", orig.read_bytes(), None, REAL,
+                               dict(source_file=str(orig), pair_id=pid)))
+        if len(rows) % 50 == 0:
+            print(f"  {name}: {len(rows)}", flush=True)
+    return rows
+
+
 SAMPLERS = {"hf_parquet": sample_hf_parquet, "hf_zip": sample_hf_zip, "hf_tar": sample_hf_tar,
-            "tgif2": sample_tgif2}
+            "tgif2": sample_tgif2, "local": sample_local}

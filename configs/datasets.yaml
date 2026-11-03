@@ -78,3 +78,42 @@ sources:
     repo: youqiwong/AIGC-Loc-Testsets
     file: AutoSplice_tp.tar
     n: 300
+
+  # ---- Classical localisation benchmarks already on disk (kind: local). Root: $IFL_BENCHMARKS
+  # (default M:/Benchmarks); these are licence-restricted and are not downloaded by scripts/download_data.sh.
+  # Where the untouched original exists it is sampled too, with the same pair_id -> matched transplant null.
+  diverse_inpaint:            # IID-Net DiverseInpainting: 11 classical / early-deep inpainting methods
+    kind: local
+    dir: DiverseInpaintingDataset
+    layout: diverse
+    n: 150
+  imd2020_inpaint:            # IMD2020 synthetic inpainting set
+    kind: local
+    dir: IMD2020 Inpainting DS
+    layout: imd2020_inpaint
+    n: 150
+  imd2020_real:               # IMD2020 real-life manipulations (+ originals)
+    kind: local
+    dir: IMD2020 Real-Life Manipulated Images
+    layout: imd2020_real
+    n: 150
+  korus:                      # Korus & Huang realistic tampering, 4 cameras (+ pristine originals)
+    kind: local
+    dir: Realistic-tampering-dataset
+    layout: korus
+    n: 150
+  nc2016:                     # NIST Nimble 2016 manipulation targets (+ base world images)
+    kind: local
+    dir: NC2016_Test0601/NC2016_Test0601
+    layout: nc2016
+    n: 150
+  defacto_inpaint:            # DEFACTO inpainting subset (COCO-based)
+    kind: local
+    dir: Defacto
+    layout: defacto_inpaint
+    n: 150
+  cmfd_velo:                  # copy-move benchmark (+ originals)
+    kind: local
+    dir: BenchmarkVelo2011CMFD
+    layout: cmfd_velo
+    n: 150

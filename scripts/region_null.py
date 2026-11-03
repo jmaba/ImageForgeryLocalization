@@ -29,7 +29,20 @@ from ifl.analysis import representativeness as R  # noqa: E402
 from ifl.analysis.store import load  # noqa: E402
 from region_tests import BLOCK, G, NB, EPS, cf_residuals, reduce_dim, rz  # noqa: E402
 
-DOMAIN = {"tgif2_orig": "tgif2", "opensdi": "opensdi", "sid_set": "sid_set"}
+DOMAIN = {"tgif2_orig": "tgif2", "opensdi": "opensdi", "sid_set": "sid_set",
+          "korus": "korus", "imd2020_real": "imd2020_real", "nc2016": "nc2016"}
+MATCHED = {"tgif2", "korus", "imd2020_real", "nc2016"}   # authentic image = the edit's own original
+
+
+def pair_source(meta, eidx):
+    """pair key -> an edited row, so an original can borrow the mask of its own edit. TGIF2 edits are
+    '<coco id>_<variant>' and share the random mask of the COCO id; local benchmarks use the full pair_id."""
+    src = {}
+    for i in eidx:
+        p, d = meta.pair_id[i], str(meta.dataset[i])
+        if isinstance(p, str):
+            src.setdefault(p.split("_")[0] if d.startswith("tgif2_") else p, i)
+    return src
 
 
 def cell_scores(D, C):
@@ -92,15 +105,12 @@ def main():
                 jobs.append((i, lab[i].reshape(-1), dict(spec=spec, dataset=d, domain=dom, kind="edited",
                                                           pair_id=meta.pair_id[i])))
         # authentic images with transplanted masks
+        src = pair_source(meta, eidx)
         for d, dom in DOMAIN.items():
             ridx = np.where((ds == d) & (meta.label.values == 0))[0][:args.max_per_dataset]
-            if dom == "tgif2":
-                src = {}
-                for i in eidx[np.char.startswith(ds[eidx].astype(str), "tgif2_")]:
-                    src.setdefault(str(meta.pair_id[i]).split("_")[0], i)   # same COCO id -> same random mask
-            donors = eidx[ds[eidx] == d] if dom != "tgif2" else None
+            donors = eidx[ds[eidx] == d] if dom not in MATCHED else None
             for i in ridx:
-                j = src.get(str(meta.pair_id[i])) if dom == "tgif2" else rng.choice(donors)
+                j = src.get(str(meta.pair_id[i])) if dom in MATCHED else rng.choice(donors)
                 if j is None:
                     continue
                 jobs.append((i, lab[j].reshape(-1), dict(spec=spec, dataset=d, domain=dom, kind="authentic",

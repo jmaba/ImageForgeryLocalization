@@ -10,18 +10,26 @@ Every training image starts from the real pool (data/ssl_real: DIV2K + ImageNet-
     inpaint_sp   SD1.5-inpainting output pasted back inside the mask        (generated content, paste-back)
     inpaint_fr   the whole SD1.5-inpainting output                          (generated inside, re-decoded outside)
     none         nothing (authentic)
+    multi        2-3 disjoint regions, each from a DIFFERENT one of --multi-types (multi-source / multi-step edits,
+                 as in DiffSeg30k or RITA-style edit chains); labels are per-cell source ids, not a binary mask
 FLUX's VAE is gated and every test editor is unseen; SD1.5-inpainting shares the SD VAE with TGIF2-SD2, so
 TGIF2-SD2 is NOT an unseen test set for models trained with vae:sd / inpaint_*.
 
 Output shard (features only, images are not kept), written incrementally as memmaps:
     data/splices_v2/<shard>/{dinov2_l6,srm,pixels}.npy  [N, 24, 24, D] fp16
     data/splices_v2/<shard>/masks.npy                     [N, 24, 24]    edited-area fraction per cell
+    data/splices_v2/<shard>/sources.npy                   [N, 24, 24]    int8 source id per cell: 0 camera,
+                                                          k >= 1 region k, -1 mixed cell (ignored)
     data/splices_v2/<shard>/meta.csv                      pool index, type, mask kind, size
     outputs/splices_v2/<shard>/examples/*.png
 
     python scripts/make_splices.py --shard vae --versions 4 \
         --types vae:sd vae:sdxl vae:qwen vae:taesd vae:dcae vae:movq proc real none
     python scripts/make_splices.py --shard inpaint --types inpaint_sp inpaint_fr --versions 1 --max-side 512
+    python scripts/make_splices.py --shard multi --types multi --versions 2 --max-side 640
+Adding feature streams to an existing shard: rerun its exact command plus --add-feats (same seed => same splices;
+each row's type/mask kind and the stored SRM features are checked, and the run stops on a mismatch):
+    python scripts/make_splices.py --shard multi --types multi --versions 2 --max-side 640 --add-feats dtcwt_phase wph
 """
 import argparse
 import io
@@ -185,6 +193,17 @@ class Inpainter:
         return np.asarray(out.convert("RGB").resize((w, h), Image.BICUBIC))
 
 
+def source_grid(S, k):
+    """Per-cell source id from a pixel source map S (0 camera, 1..k regions): a cell is camera only if it has
+    no edited pixel, region r if r covers at least half of it, otherwise mixed (-1)."""
+    frac = np.stack([area_resize((S == r).astype(np.float32), GRID) for r in range(k + 1)])
+    g = np.full((GRID, GRID), -1, np.int8)
+    g[frac[0] >= 1 - 1e-6] = 0
+    for r in range(1, k + 1):
+        g[frac[r] >= 0.5] = r
+    return g
+
+
 def donor_region(pool, i, h, w, rng):
     j = rng.integers(len(pool))
     while j == i:
@@ -204,6 +223,10 @@ def main():
     ap.add_argument("--object-p", type=float, default=0.5, help="probability of an object-shaped mask")
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--multi-types", nargs="+",
+                    default=["vae:sd", "vae:sdxl", "vae:qwen", "vae:taesd", "vae:movq", "proc", "real", "inpaint_sp"])
+    ap.add_argument("--add-feats", nargs="+", default=None,
+                    help="regenerate an existing shard and only write these extra feature streams")
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
     pool = pd.read_csv(DATA / "ssl_real" / "pool.csv")
@@ -216,65 +239,128 @@ def main():
     ex = OUTPUTS / "splices_v2" / args.shard / "examples"
     ex.mkdir(parents=True, exist_ok=True)
 
-    codecs = {t: Codec(t[4:]) for t in args.types if t.startswith("vae:")}
-    inpaint = Inpainter() if any(t.startswith("inpaint") for t in args.types) else None
+    used = set(args.types) | (set(args.multi_types) if "multi" in args.types else set())
+    codecs = {t: Codec(t[4:]) for t in sorted(used) if t.startswith("vae:")}
+    inpaint = Inpainter() if any(t.startswith("inpaint") for t in used) else None
     mult = max([8] + [c.mult for c in codecs.values()])
     ext = {"dinov2_l6": build("dinov2:l6"), "srm": build("srm"), "pixels": build("pixels")}
     sizes = {"dinov2_l6": 336, "srm": None, "pixels": 216}
     N = len(pool) * args.versions
     mm = {}
-    masks = np.lib.format.open_memmap(out / "masks.npy", "w+", np.float16, (N, GRID, GRID))
+    add = args.add_feats
+    if add:
+        old_meta = pd.read_csv(out / "meta.csv")
+        old_srm = np.load(out / "srm.npy", mmap_mode="r")
+        N = min(N, len(old_meta))
+        del ext["pixels"]
+        ext.update({k: build(k) for k in add})
+        sizes.update({k: None for k in add})
+        store, srm_err = set(add), []
+    else:
+        store = set(ext)
+        masks = np.lib.format.open_memmap(out / "masks.npy", "w+", np.float16, (N, GRID, GRID))
+        sources = np.lib.format.open_memmap(out / "sources.npy", "w+", np.int8, (N, GRID, GRID))
     meta = []
     t0 = time.time()
     n = 0
+    def draw_mask(a):
+        m = object_mask(a, ext["dinov2_l6"], rng) if rng.random() < args.object_p else None
+        return (m, "object") if m is not None else (random_mask(h, w, rng), "random")
+
+    def region_source(typ, base, m):
+        if typ.startswith("vae:"):
+            return codecs[typ](a)
+        if typ == "proc":
+            return processed(a, rng)
+        if typ == "real":
+            return donor_region(pool, i, h, w, rng)
+        return inpaint(base, m, rng)
+
+    def paste(base, src, m):
+        return (m[..., None] * src + (1 - m[..., None]) * base).round().clip(0, 255).astype(np.uint8)
+
     for i in range(len(pool)):
+        if n >= N:
+            break
         a = load_pool_image(pool.path[i], args.max_side, mult)
         h, w = a.shape[:2]
         for v in range(args.versions):
             typ = str(rng.choice(args.types, p=probs))
-            mkind = "none"
+            mkind, parts = "none", ""
+            S, nk = np.zeros((h, w), np.int8), 1
             if typ == "none":
                 comp, m = a, np.zeros((h, w), np.float32)
+            elif typ == "multi":
+                # disjoint regions, each from a different source; later regions avoid earlier ones and the
+                # union stays below half the image (the majority-authentic assumption of pair_ref)
+                kinds = list(rng.choice(args.multi_types, int(rng.integers(2, 4)), replace=False))
+                comp, mkind, done = a, "multi", []
+                for t in kinds:
+                    for _ in range(6):
+                        mr, _ = draw_mask(a)
+                        mr = mr * (S == 0)
+                        frac = (mr >= 0.5).mean()
+                        if frac >= 0.03 and (S > 0).mean() + frac <= 0.5:
+                            break
+                    else:
+                        continue
+                    comp = paste(comp, region_source(t, comp, mr), mr)
+                    done.append(t)
+                    S[(mr >= 0.5) & (S == 0)] = len(done)
+                m = (S > 0).astype(np.float32)
+                nk, parts = max(1, len(done)), "+".join(done)
             else:
-                m = object_mask(a, ext["dinov2_l6"], rng) if rng.random() < args.object_p else None
-                mkind = "object" if m is not None else "random"
-                if m is None:
-                    m = random_mask(h, w, rng)
-                if typ.startswith("vae:"):
-                    src = codecs[typ](a)
-                elif typ == "proc":
-                    src = processed(a, rng)
-                elif typ == "real":
-                    src = donor_region(pool, i, h, w, rng)
-                else:
-                    src = inpaint(a, m, rng)
-                if typ == "inpaint_fr":
-                    comp = src
-                else:
-                    comp = (m[..., None] * src + (1 - m[..., None]) * a).round().clip(0, 255).astype(np.uint8)
+                m, mkind = draw_mask(a)
+                src = region_source(typ, a, m)
+                comp = src if typ == "inpaint_fr" else paste(a, src, m)
+                S[m >= 0.5] = 1
             if rng.random() < 0.3:   # whole-image re-save, as when an edit is shared
                 comp = jpeg(comp, rng.integers(85, 99))
             im = Image.fromarray(comp)
+            if add and (typ, mkind) != (old_meta.type[n], old_meta.mask_kind[n]):
+                raise SystemExit(f"row {n}: regenerated {typ}/{mkind} != stored {old_meta.type[n]}/"
+                                 f"{old_meta.mask_kind[n]} (different --types order, seed or code)")
             for k, e in ext.items():
+                if k not in store and k != "srm":
+                    continue
                 x = im.resize((sizes[k], sizes[k]), Image.BICUBIC) if sizes[k] else im
                 _, p = e(torch.from_numpy(np.asarray(x).copy()).permute(2, 0, 1)[None])
+                if add and k == "srm":       # same splice? relative error of the stored SRM features
+                    ref = np.asarray(old_srm[n], np.float32)
+                    srm_err.append(float(np.abs(p[0] - ref).mean() / (np.abs(ref).mean() + 1e-6)))
+                    if srm_err[-1] > 0.05:
+                        raise SystemExit(f"row {n}: SRM features differ from the stored shard ({srm_err[-1]:.3f})")
+                if k not in store:
+                    continue
                 if k not in mm:
                     mm[k] = np.lib.format.open_memmap(out / f"{k}.npy", "w+", np.float16, (N,) + p.shape[1:])
                 mm[k][n] = p[0].astype(np.float16)
+            if add:
+                n += 1
+                continue
             masks[n] = area_resize((m >= 0.5).astype(np.float32), GRID).astype(np.float16)
+            sources[n] = source_grid(S, nk)
             meta.append(dict(pool_idx=i, version=v, type=typ, mask_kind=mkind, source=pool.source[i], h=h, w=w,
-                             mask_frac=float((m >= 0.5).mean())))
+                             mask_frac=float((m >= 0.5).mean()), parts=parts))
             if i < 16 and v == 0:
                 tag = typ.replace(":", "-")
                 im.save(ex / f"{i:03d}_{tag}_{mkind}.png")
-                Image.fromarray((m * 255).astype(np.uint8)).save(ex / f"{i:03d}_{tag}_{mkind}_mask.png")
+                vis = (S.astype(np.float32) / max(1, nk) * 255) if typ == "multi" else m * 255
+                Image.fromarray(vis.astype(np.uint8)).save(ex / f"{i:03d}_{tag}_{mkind}_mask.png")
             n += 1
         if i % 50 == 0:
-            print(f"{i}/{len(pool)}  {time.time() - t0:.0f}s", flush=True)
+            print(f"{i}/{len(pool)}  {time.time() - t0:.0f}s" +
+                  (f"  SRM rel. err. max {max(srm_err):.4f}" if add else ""), flush=True)
+            if add:
+                continue
             pd.DataFrame(meta).to_csv(out / "meta.csv", index=False)   # checkpoint: rows < len(meta) are valid
     for k in mm:
         mm[k].flush()
+    if add:
+        print(f"added {sorted(store)} to {n} rows; SRM rel. err. mean {np.mean(srm_err):.4f} max {max(srm_err):.4f}")
+        return
     masks.flush()
+    sources.flush()
     df = pd.DataFrame(meta)
     df.to_csv(out / "meta.csv", index=False)
     print(df.groupby(["type", "mask_kind"]).size(), flush=True)
