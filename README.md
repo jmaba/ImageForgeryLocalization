@@ -77,6 +77,8 @@ python scripts/train_comparator.py --shards vae inpaint --tag all       # learne
 python scripts/train_comparator.py --shards vae inpaint --exclude-types vae:qwen --tag loo_qwen
 python scripts/pool_features.py --variants clean jpeg resize            # real pool cell features (+ launderings)
 python scripts/train_predictor.py --tag ctx --test-suffixes "" __jpeg75 # predictive self-consistency (real-only)
+python scripts/train_comparator.py --shards vae inpaint --exclude-types inpaint_fr --tag base --save
+python scripts/train_predictor.py --tag fuse2 --fuse outputs/comparator/model_base.pt   # best system: z-fusion (docs/05)
 ```
 `scripts/run_pipeline.sh` runs the reported configuration end to end.
 

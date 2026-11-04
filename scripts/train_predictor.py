@@ -17,6 +17,17 @@ control, image-level TPR, perturbed test copies.
 
     python scripts/train_predictor.py --tag ctx_small
     python scripts/train_predictor.py --tag ctx_big --d 384 --layers 8 --steps 40000 --batch 64   # bigger GPU
+    python scripts/train_predictor.py --tag ctx_f25 --pool-frac 0.25          # data scaling (same validation set)
+    python scripts/train_predictor.py --tag fuse --fuse outputs/comparator/model_base.pt   # + comparator fusion
+    python scripts/train_predictor.py --tag trace --targets srm --fuse outputs/comparator/model_base.pt
+--targets: the streams that are hidden and predicted (default: all). The others (e.g. DINOv2) are never hidden and
+join the content token, so a hidden cell's noise residual is predicted from its own semantics + colour and from
+its neighbours: the error then measures the trace, not how predictable the content is.
+ctx_norm: the log error minus the log error expected for REAL cells with the same content token (ridge regression
+fitted on held-out pool images), so hard-to-predict texture alone is not suspicious.
+--fuse adds the saved comparator's pair_ref/point, their own ensemble (cmp_z2, the control for any fusion gain)
+and per-image fusions with the predictor: fuse_rank (mean of within-image ranks of ctx_all and pair_ref),
+fuse_z (sum of within-image z-scores), fuse_z_point (+ point), fuse_norm (ctx_norm + pair_ref + point).
 """
 import argparse
 import sys
@@ -32,7 +43,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ifl import DATA  # noqa: E402
-from train_comparator import G2, Projector, test  # noqa: E402
+from train_comparator import G2, Projector, cell_score, load_models, test  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 G = 24
@@ -98,6 +109,10 @@ def main():
     ap.add_argument("--no-own-content", action="store_true")
     ap.add_argument("--max-per-dataset", type=int, default=150)
     ap.add_argument("--test-suffixes", nargs="+", default=[""])
+    ap.add_argument("--pool-frac", type=float, default=1.0, help="fraction of the training pool images used")
+    ap.add_argument("--fuse", default=None, help="comparator checkpoint (train_comparator.py --save)")
+    ap.add_argument("--targets", nargs="+", default=None, help="streams to predict (default: all of --feats)")
+    ap.add_argument("--norm-images", type=int, default=300, help="held-out pool images for the ctx_norm fit")
     args = ap.parse_args()
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -112,6 +127,8 @@ def main():
                                          for a in raw[v]], -1)
     va_img = rng.choice(N, int(0.15 * N), replace=False)
     tr_img = np.setdiff1d(np.arange(N), va_img)
+    if args.pool_frac < 1:                                   # data scaling: nested subsets, same validation set
+        tr_img = np.sort(np.random.default_rng(2).permutation(tr_img)[:int(round(args.pool_frac * len(tr_img)))])
     proj = Projector(dims).fit(cat("clean", rng.choice(tr_img, min(150, len(tr_img)), replace=False))
                                .reshape(-1, sum(dims)))
     X = np.empty((len(args.variants) * N, G2, len(proj.mu)), np.float16)          # [V*N,576,D], fp16 in RAM
@@ -130,18 +147,28 @@ def main():
     Xt, Ct = (Xt.to(DEV), Ct.to(DEV)) if on_gpu else (Xt, Ct)
     del X
     split = np.cumsum([0] + [min(d, 256) for d in dims])        # stream boundaries after projection
-    print(f"[{args.tag}] pool {N} x {len(args.variants)} variants  train {len(rows_tr)}  val {len(rows_va)}  "
-          f"D={Xt.shape[-1]} streams {dict(zip(args.feats, np.diff(split)))}  data on {'GPU' if on_gpu else 'CPU'}",
-          flush=True)
+    tgt = args.targets or args.feats
+    is_t = [f in tgt for f in args.feats]
+    span = [np.arange(split[k], split[k + 1]) for k in range(len(dims))]
+    ti = torch.from_numpy(np.concatenate([a for a, t in zip(span, is_t) if t])).to(DEV)
+    ci = torch.from_numpy(np.concatenate([a for a, t in zip(span, is_t) if not t] + [np.zeros(0, int)])).to(DEV)
+    tsplit = np.cumsum([0] + [len(a) for a, t in zip(span, is_t) if t])
 
-    model = CtxPredictor(Xt.shape[-1], Cz.shape[-1], args.d, args.layers, args.heads,
+    def parts(x, c):
+        """projected features + normalised pixel stats -> (targets, content = pixels + non-target streams)"""
+        return x[..., ti], torch.cat([c, x[..., ci]], -1)
+    print(f"[{args.tag}] pool {N} x {len(args.variants)} variants  train {len(rows_tr)}  val {len(rows_va)}  "
+          f"D={Xt.shape[-1]} streams {dict(zip(args.feats, np.diff(split)))}  targets {tgt}  "
+          f"data on {'GPU' if on_gpu else 'CPU'}", flush=True)
+
+    model = CtxPredictor(len(ti), Cz.shape[-1] + len(ci), args.d, args.layers, args.heads,
                          not args.no_own_content).to(DEV)
     opt = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=0.05)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=args.steps, pct_start=0.05)
 
     def loss_on(rows, masks, train):
         idx = torch.from_numpy(np.asarray(rows))
-        x, c = Xt[idx].to(DEV).float(), Ct[idx].to(DEV)
+        x, c = parts(Xt[idx].to(DEV).float(), Ct[idx].to(DEV))
         if train and rng.random() < 0.5:
             x, c = flip(x), flip(c)
         m = torch.from_numpy(masks).to(DEV)
@@ -170,35 +197,76 @@ def main():
                 vl = np.mean([loss_on(rows_va[k:k + 64], vm[k:k + 64], False).item()
                               for k in range(0, len(rows_va), 64)])
             print(f"  step {step}  train {loss.item():.4f}  val {vl:.4f}  {time.time() - t0:.0f}s", flush=True)
-    val_tab = pd.DataFrame({"val masked MSE": [vl], "train images": [len(rows_tr)]})
-    del Xt, Ct
+    val_tab = pd.DataFrame({"val masked MSE": [vl], "train images": [len(rows_tr)], "targets": [" ".join(tgt)]})
 
-    # ---------------- scorer for the comparator harness
+    # ---------------- per-cell error under the sliding masks
     SM = torch.from_numpy(sliding_masks()).to(DEV)
     cover = SM.float().sum(0)
     model.eval()
 
     @torch.no_grad()
-    def score(x, C):
-        x = torch.from_numpy(x).to(DEV)
-        c = torch.from_numpy(((C - cmu) / csd).astype(np.float32)).to(DEV)
+    def cell_err(x, c):
+        """x [576,D] projected, c [576,Dc] normalised pixel stats (GPU) -> ([576,Dt] error, [576,Dc'] content)"""
+        x, c = parts(x, c)
         n = len(SM)
         with torch.autocast("cuda", dtype=torch.float16, enabled=DEV == "cuda"):
             pred = model(x[None].expand(n, -1, -1), c[None].expand(n, -1, -1), SM).float()
-        e = (pred - x[None]) ** 2                                    # [n,576,D]
-        out = {}
-        parts = {"ctx_all": (0, split[-1])} | {f"ctx_{f.split('_')[0]}": (split[k], split[k + 1])
-                                                for k, f in enumerate(args.feats)}
-        for name, (a, b) in parts.items():
-            out[name] = ((e[..., a:b].mean(-1) * SM).sum(0) / cover).cpu().numpy()
+        return ((pred - x[None]) ** 2 * SM[..., None]).sum(0) / cover[:, None], c
+
+    # ---------------- content normalisation: expected log error of a REAL cell given its content token
+    from sklearn.linear_model import Ridge
+    E, Q = [], []
+    for r in np.random.default_rng(3).permutation(rows_va)[:args.norm_images]:
+        e, c = cell_err(Xt[r].to(DEV).float(), Ct[r].to(DEV))
+        E.append(torch.log(e.mean(-1) + 1e-6).cpu().numpy())
+        Q.append(c.cpu().numpy())
+    E, Q = np.concatenate(E), np.concatenate(Q)
+    norm = Ridge(alpha=10.0).fit(Q, E)
+    val_tab["content R2 of log error"] = r2 = norm.score(Q, E)
+    print(f"  content explains {r2:.2f} of the real-cell log-error variance", flush=True)
+    del Xt, Ct, E, Q
+
+    cmp = load_models(args.fuse) if args.fuse else None
+
+    def rank(s):
+        return np.argsort(np.argsort(s)) / (len(s) - 1)
+
+    def zs(s):
+        return (s - s.mean()) / (s.std() + 1e-8)
+
+    @torch.no_grad()
+    def score(xr, C):
+        """xr: raw (unprojected) cell features, so the comparator can apply its own projector"""
+        out = ctx_score(proj(xr), C)
+        if cmp:
+            models, cproj, cg = cmp
+            xc = cproj(xr[:, cg])
+            sc = {**cell_score(models["pair"], "pair", xc), **cell_score(models["point"], "point", xc)}
+            cz = zs(sc["pair_ref"]) + zs(sc["point"])
+            out |= {"cmp_pair_ref": sc["pair_ref"], "cmp_point": sc["point"], "cmp_z2": cz,
+                    "fuse_rank": (rank(out["ctx_all"]) + rank(sc["pair_ref"])) / 2,
+                    "fuse_z": zs(out["ctx_all"]) + zs(sc["pair_ref"]),
+                    "fuse_z_point": zs(out["ctx_all"]) + cz,
+                    "fuse_norm": zs(out["ctx_norm"]) + cz}
+        return out
+
+    @torch.no_grad()
+    def ctx_score(x, C):
+        e, c = cell_err(torch.from_numpy(x).to(DEV), torch.from_numpy(((C - cmu) / csd).astype(np.float32)).to(DEV))
+        out = {"ctx_all": e.mean(-1).cpu().numpy()}
+        tn = [f for f, t in zip(args.feats, is_t) if t]
+        if len(tn) > 1:
+            out |= {f"ctx_{f.split('_')[0]}": e[:, tsplit[k]:tsplit[k + 1]].mean(-1).cpu().numpy()
+                    for k, f in enumerate(tn)}
+        out["ctx_norm"] = np.log(out["ctx_all"] + 1e-6) - norm.predict(c.cpu().numpy())
         return out
 
     args.cols, args.shards, args.exclude_types = [], ["ssl_real/" + v for v in args.variants], []
     args.gcols = np.arange(sum(dims))
     args.title = "Predictive self-consistency (real-only context predictor)"
-    proj_test = proj
-    for suffix in args.test_suffixes:
-        test(score, proj_test, args, args.tag + suffix, suffix, val_tab)
+    val_tab["pool frac"] = args.pool_frac
+    for suffix in args.test_suffixes:                         # identity projector: score() projects itself
+        test(score, lambda r: np.asarray(r, np.float32), args, args.tag + suffix, suffix, val_tab)
 
 
 if __name__ == "__main__":

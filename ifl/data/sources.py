@@ -297,14 +297,23 @@ def _local_items(layout: str, root: Path):
     elif layout == "defacto_inpaint":            # img/x.tif + inpaint_mask/x.tif (COCO-based)
         items = [(p, root / "inpaint_mask" / p.name, False, p.stem, "inpaint", None)
                  for p in sorted((root / "img").glob("*.tif"))]
-    elif layout == "cmfd_velo":                  # <cam>/X_N.png + X_N_alpha.png, original X_orig.*
+    elif layout == "cmfd_velo":                  # <cam>/X_copy.png forgery, X.png original (lossless)
+        # X_N.png / X_N_alpha.png are the snippet LAYERS (object on white), not forgeries. The ground truth is
+        # where the forgery differs from the original (the pasted targets), written to data/_cache/cmfd_velo.
+        from scipy import ndimage
+        cache = DATA / "_cache" / "cmfd_velo"
+        cache.mkdir(parents=True, exist_ok=True)
         for cam in sorted(p for p in root.iterdir() if p.is_dir()):
-            for p in sorted(cam.glob("*_[0-9]*.png")):
-                if p.stem.endswith("_alpha") or "_trim" in p.stem:
-                    continue
-                scene = p.stem.rsplit("_", 1)[0]
-                orig = next(iter(cam.glob(f"{scene}_orig.*")), None)
-                items.append((p, p.with_name(p.stem + "_alpha.png"), False, f"{cam.name}_{p.stem}", cam.name, orig))
+            for p in sorted(cam.glob("*_copy.png")):
+                scene = p.stem[:-len("_copy")]
+                orig = cam / f"{scene}.png"
+                mp = cache / f"{cam.name}_{scene}.png"
+                if orig.exists() and not mp.exists():
+                    a = np.asarray(Image.open(p).convert("RGB"), np.int16)
+                    b = np.asarray(Image.open(orig).convert("RGB"), np.int16)
+                    m = ndimage.binary_opening(ndimage.binary_closing(np.abs(a - b).sum(-1) > 24, iterations=3), iterations=2)
+                    Image.fromarray(m.astype(np.uint8) * 255).save(mp)
+                items.append((p, mp, False, f"{cam.name}_{scene}", cam.name, orig))
     else:
         raise KeyError(layout)
     return [it for it in items if it[1].exists()]

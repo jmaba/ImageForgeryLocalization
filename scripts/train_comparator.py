@@ -168,6 +168,19 @@ def pair_auc(model, X, src, n_pairs=2000, seed=0):
     return out
 
 
+def load_models(path):
+    """-> (models dict, Projector, gcols) saved by --save"""
+    ck = torch.load(path, map_location=DEV, weights_only=False)
+    models = {}
+    for k, cls in (("pair", Pair), ("point", Point)):
+        models[k] = cls(ck["d_in"]).to(DEV)
+        models[k].load_state_dict(ck[k])
+        models[k].eval()
+    proj = Projector(ck["proj"]["dims"])
+    vars(proj).update(ck["proj"])
+    return models, proj, ck["gcols"]
+
+
 def shard_dir(name):
     return DATA / "splices" if name == "v1" else DATA / "splices_v2" / name
 
@@ -212,6 +225,7 @@ def main():
                     help='feature-dir suffixes of perturbed test copies, e.g. "" __jpeg75 __sr4')
     ap.add_argument("--cols", nargs="*", default=[],
                     help="keep only some columns of a stream (ablations), e.g. dtcwt_phase=1,3,5,6,8,11,12,14,15")
+    ap.add_argument("--save", action="store_true", help="also write outputs/comparator/model_<tag>.pt (fusion)")
     args = ap.parse_args()
     tag = args.tag or "+".join(args.feats)
     out = OUTPUTS / "comparator"
@@ -259,6 +273,9 @@ def main():
     print(f"[{tag}] shards {args.shards}  train {len(tr)}  val {len(va)}  D={X.shape[-1]}  "
           f"excluded {args.exclude_types}", flush=True)
     models = {k: train(k, X, src, tr, va, X.shape[-1], args.steps) for k in ("pair", "point")}
+    if args.save:
+        torch.save(dict(feats=args.feats, gcols=args.gcols, d_in=X.shape[-1], proj=vars(proj),
+                        **{k: m.state_dict() for k, m in models.items()}), out / f"model_{tag}.pt")
     val_rows = []
     for k, m in models.items():
         for (t, mk), sel in meta.iloc[va].groupby(["type", "mask_kind"]).groups.items():

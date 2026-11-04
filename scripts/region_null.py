@@ -30,8 +30,8 @@ from ifl.analysis.store import load  # noqa: E402
 from region_tests import BLOCK, G, NB, EPS, cf_residuals, reduce_dim, rz  # noqa: E402
 
 DOMAIN = {"tgif2_orig": "tgif2", "opensdi": "opensdi", "sid_set": "sid_set",
-          "korus": "korus", "imd2020_real": "imd2020_real", "nc2016": "nc2016"}
-MATCHED = {"tgif2", "korus", "imd2020_real", "nc2016"}   # authentic image = the edit's own original
+          "korus": "korus", "imd2020_real": "imd2020_real", "nc2016": "nc2016", "cmfd_velo": "cmfd_velo"}
+MATCHED = {"tgif2", "korus", "imd2020_real", "nc2016", "cmfd_velo"}   # authentic image = the edit's own original
 
 
 def pair_source(meta, eidx):
