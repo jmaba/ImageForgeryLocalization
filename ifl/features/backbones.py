@@ -190,6 +190,21 @@ def build(spec: str):
     if name in ("psteer", "wph"):  # steerable-pyramid PS stats / scattering spectra + phase harmonics
         from ifl.features.scattering import SteerPyrPS, WPHScat
         return SteerPyrPS() if name == "psteer" else WPHScat()
+    if name == "physics":  # lighting/shading + defocus-vs-depth consistency (ifl/features/physics.py)
+        from ifl.features.physics import PhysicsStats
+        return PhysicsStats()
+    if name in ("trufor", "mesorch"):  # published supervised localizers as baselines (ifl/features/baselines.py)
+        from ifl.features.baselines import MesorchMap, TruForMap
+        return TruForMap() if name == "trufor" else MesorchMap()
+    if name == "flame":  # FLAME (arXiv:2606.02178), local high-frequency energy + SAM2 adapter
+        from ifl.features.baselines import FlameMap
+        return FlameMap()
+    if name in ("bfree", "bfreeimg"):  # B-Free (CVPR 2025) detector; "bfree" adds a sliding-window map
+        from ifl.features.baselines import BFreeMap
+        return BFreeMap(local=name == "bfree")
+    if name in ("dtraceA", "dtraceB"):  # decoder-trace detector trained on autoencoder round trips (docs/09)
+        from ifl.features.dtrace import DecoderTraceMap
+        return DecoderTraceMap(name[-1])
     if name.startswith("rt2-"):  # Proposal 2: double round-trip through the named VAE (rt2-sd, rt2-qwen ...)
         from ifl.features.roundtrip import RoundTrip
         return RoundTrip(name[4:])
