@@ -42,7 +42,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ifl import DATA  # noqa: E402
+from ifl import DATA, OUTPUTS  # noqa: E402
 from train_comparator import G2, Projector, cell_score, load_models, test  # noqa: E402
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -95,6 +95,30 @@ def flip(t):
     return t.reshape(t.shape[0], G, G, -1).flip(2).reshape(t.shape)
 
 
+def load_predictor(path):
+    """-> score(xr [576, D raw features in ck['feats'] order], C [576,33] pixel stats) -> {ctx_all, ctx_norm}"""
+    ck = torch.load(path, map_location=DEV, weights_only=False)
+    model = CtxPredictor(ck["d_x"], ck["d_c"], ck["d"], ck["layers"], ck["heads"], ck["own"]).to(DEV).eval()
+    model.load_state_dict(ck["state"])
+    proj = Projector(ck["proj"]["dims"])
+    vars(proj).update(ck["proj"])
+    ti, ci = ck["ti"].to(DEV), ck["ci"].to(DEV)
+    SM = torch.from_numpy(sliding_masks()).to(DEV)
+    cover = SM.float().sum(0)
+
+    @torch.no_grad()
+    def score(xr, C):
+        x = torch.from_numpy(proj(xr)).to(DEV)
+        c = torch.from_numpy(((C - ck["cmu"]) / ck["csd"]).astype(np.float32)).to(DEV)
+        xt, cc = x[..., ti], torch.cat([c, x[..., ci]], -1)
+        n = len(SM)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=DEV == "cuda"):
+            pred = model(xt[None].expand(n, -1, -1), cc[None].expand(n, -1, -1), SM).float()
+        e = (((pred - xt[None]) ** 2 * SM[..., None]).sum(0) / cover[:, None]).mean(-1).cpu().numpy()
+        return {"ctx_all": e, "ctx_norm": np.log(e + 1e-6) - ck["norm"].predict(cc.cpu().numpy())}
+    return score
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--feats", nargs="+", default=["dinov2_l6", "srm"])
@@ -113,6 +137,7 @@ def main():
     ap.add_argument("--fuse", default=None, help="comparator checkpoint (train_comparator.py --save)")
     ap.add_argument("--targets", nargs="+", default=None, help="streams to predict (default: all of --feats)")
     ap.add_argument("--norm-images", type=int, default=300, help="held-out pool images for the ctx_norm fit")
+    ap.add_argument("--save", action="store_true", help="write outputs/comparator/predictor_<tag>.pt (ensemble expert)")
     args = ap.parse_args()
     torch.manual_seed(0)
     rng = np.random.default_rng(0)
@@ -225,6 +250,11 @@ def main():
     val_tab["content R2 of log error"] = r2 = norm.score(Q, E)
     print(f"  content explains {r2:.2f} of the real-cell log-error variance", flush=True)
     del Xt, Ct, E, Q
+    if args.save:
+        torch.save(dict(state=model.state_dict(), d_x=len(ti), d_c=Cz.shape[-1] + len(ci), d=args.d,
+                        layers=args.layers, heads=args.heads, own=not args.no_own_content, ti=ti.cpu(), ci=ci.cpu(),
+                        proj=vars(proj), cmu=cmu, csd=csd, norm=norm, feats=args.feats),
+                   OUTPUTS / "comparator" / f"predictor_{args.tag}.pt")
 
     cmp = load_models(args.fuse) if args.fuse else None
 
@@ -265,7 +295,7 @@ def main():
     args.gcols = np.arange(sum(dims))
     args.title = "Predictive self-consistency (real-only context predictor)"
     val_tab["pool frac"] = args.pool_frac
-    for suffix in args.test_suffixes:                         # identity projector: score() projects itself
+    for suffix in [s for s in args.test_suffixes if s != "none"]:   # identity projector: score() projects itself
         test(score, lambda r: np.asarray(r, np.float32), args, args.tag + suffix, suffix, val_tab)
 
 

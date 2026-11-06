@@ -298,32 +298,40 @@ def main():
 
 def test(models, proj, args, tag, suffix, val_tab):
     """Same images for every suffix: the subsample and the donor masks are seeded per dataset.
-    `models` is the trained pair/point dict, or any callable (x [576,D], pixel stats C [576,33]) -> {name: scores}."""
+    `models` is the trained pair/point dict, or any callable (x [576,D], pixel stats C [576,33]) -> {name: scores}.
+    args.dump (optional) also writes every scorer's per-cell scores to outputs/ensemble/dump_<tag>.pkl."""
     out = OUTPUTS / "comparator"
 
     # ---------------- test: all edited datasets + authentic images with transplanted masks
     names = [f + suffix for f in args.feats]
-    fs = load_multi(names) if len(names) > 1 else load(names[0])
-    pix = load("pixels" + suffix)
+    sel = sorted(getattr(args, "only_datasets", None) or []) or None   # load only these datasets when restricted
+    fs = load_multi(names, sel) if len(names) > 1 else load(names[0], sel)
+    pix = load("pixels" + suffix, sel)
     pkey = {k: i for i, k in enumerate(pix.meta.dataset + "/" + pix.meta.sample_id.astype(str))}
     tm = fs.meta.reset_index(drop=True)
     keys = (tm.dataset + "/" + tm.sample_id.astype(str)).values
     eidx, tlab = R._edited(fs)
     ds = tm.dataset.values
     jobs = []
+    only = set(getattr(args, "only_datasets", None) or [])          # optional: restrict the test to these datasets
     for d in np.unique(ds[eidx]):
-        dom = "tgif2" if d.startswith("tgif2") else d
+        if only and d not in only:
+            continue
+        dom = ("tgif2" if d.startswith("tgif2") else "bench26" if d.startswith("bench_")
+               else "benchx" if d.startswith("benchx_") else d)
         perm = np.random.default_rng(zlib.crc32(d.encode())).permutation(eidx[ds[eidx] == d])
         for i in perm[:args.max_per_dataset]:
             jobs.append((i, tlab[i].reshape(-1), dict(dataset=d, domain=dom, kind="edited")))
     src = pair_source(tm, eidx)
     for d, dom in DOMAIN.items():
+        if only and d not in only:
+            continue
         donors, r = eidx[ds[eidx] == d], np.random.default_rng(zlib.crc32(d.encode()) + 1)
         for i in np.where((ds == d) & (tm.label.values == 0))[0][:args.max_per_dataset]:
             j = src.get(str(tm.pair_id[i])) if dom in MATCHED else r.choice(donors)
             if j is not None:
                 jobs.append((i, tlab[j].reshape(-1), dict(dataset=d, domain=dom, kind="authentic")))
-    rows = []
+    rows, dumps = [], []
     for n, (i, l, info) in enumerate(jobs):
         x = proj(np.asarray(fs.P[i], np.float32).reshape(G2, -1)[:, args.gcols])
         C = np.asarray(pix.P[pkey[keys[i]]], np.float32).reshape(G2, -1)
@@ -341,8 +349,16 @@ def test(models, proj, args, tag, suffix, val_tab):
                 rows.append(dict(info, scorer=nm, auc=R._auc(l[v], ss[v]) if (l[v] == 1).any() else np.nan,
                                  auc_int=R._auc(l[vi], ss[vi]) if (l[vi] == 1).any() and (l[vi] == 0).any()
                                  else np.nan, T=float(np.sort(s)[-10:].mean())))
+        if getattr(args, "dump", False):          # per-cell scores of every scorer, for offline aggregation
+            dumps.append(dict(info, sample=keys[i], l=l.astype(np.int8), band=band, pix=ps.astype(np.float32),
+                              scores={k: np.asarray(s, np.float32) for k, s in sc.items()}))
         if n % 300 == 0:
             print(f"  test {n}/{len(jobs)}", flush=True)
+    if getattr(args, "dump", False):
+        import pickle
+        (OUTPUTS / "ensemble").mkdir(parents=True, exist_ok=True)
+        with open(OUTPUTS / "ensemble" / f"dump_{tag}.pkl", "wb") as fh:
+            pickle.dump(dumps, fh)
     df = pd.DataFrame(rows)
     df.to_csv(out / f"rows_{tag}.csv", index=False)
 
